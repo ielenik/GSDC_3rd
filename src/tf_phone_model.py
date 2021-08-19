@@ -86,10 +86,11 @@ class PsevdoDistancesLayer(tf.keras.layers.Layer):
         distance = tf.linalg.norm(inputs - self.sat_poses, axis = -1)
         isrbm = tf.gather(self.isrbm_bias, self.sat_types)
         isrbm = tf.transpose(isrbm)
-        errors = (distance -  self.psevdo_dist - isrbm)
+        errors = tf.abs(self.psevdoweights*(distance -  self.psevdo_dist - isrbm))
+        errors = errors - tf.nn.relu(errors - 3)*0.7
 
-        return tf.reduce_mean((self.psevdoweights*tf.nn.softsign(tf.abs(errors)/5))), errors
-        #return tf.reduce_mean(tf.abs(errors)/5), errors
+        #return tf.reduce_mean((self.psevdoweights*tf.nn.softsign(tf.abs(errors)/5))), errors
+        return tf.reduce_mean(errors), errors
 
     def compute_output_shape(self, _):
         return (1)
@@ -114,8 +115,9 @@ class DeltaRangeLayer(tf.keras.layers.Layer):
         shift = inputs[1:] - inputs[:-1]
         scalar = tf.reduce_sum(shift*self.sat_directions, axis = -1)
         errors = (scalar +  self.sat_deltarange - self.delta_epoch_bias)*self.sat_deltavalid
-        return tf.reduce_mean(tf.nn.softsign(tf.abs(errors)/10)), errors
-        #return tf.reduce_mean(tf.abs(errors)), errors
+        errors = tf.abs(errors) - tf.nn.relu(tf.abs(errors) - 0.2)*0.7
+        #return tf.reduce_mean(tf.nn.softsign(tf.abs(errors))), errors
+        return tf.reduce_mean(tf.abs(errors)), errors
 
     def compute_output_shape(self, _):
         return (1)
@@ -308,11 +310,11 @@ def createGpsPhoneModel(df_raw, df_baseline, mat_local, dog, slac):
 
     print(np.sum(abs(dists_corr) > 1000))
     sat_psevdovalid[abs(dists_corr) > 1000] = 0
-    dists_corr = dists_corr*sat_psevdovalid
+    sat_psevdoweights = sat_psevdoweights*sat_psevdovalid
+    dists_corr = dists_corr*sat_psevdoweights
     loss = np.mean(np.abs(dists_corr[sat_psevdovalid > 0]))
     print("Initial psevdo range loss ", loss)
 
-    sat_psevdoweights = sat_psevdoweights*sat_psevdovalid
     psevdo_layer = PsevdoDistancesLayer(num_used_satelites,num_epochs,sat_types,sat_positions,sat_psevdodist,sat_psevdoweights)
 
     sat_directions = sat_positions - baselines
@@ -364,6 +366,7 @@ def createTrackModel(start_nanos, end_nanos, df_baseline, mat_local):
         positions[i] = np.matmul(positions[i], mat_local)
 
     rover_pos  = WeightsData(positions, None, True)
+    pos_bias = tf.Variable(np.zeros((1,3)), trainable=True)
 
     #model to get position at given times (for training phone models)
     model_input = tf.keras.layers.Input((1), dtype=tf.int64)
@@ -371,13 +374,13 @@ def createTrackModel(start_nanos, end_nanos, df_baseline, mat_local):
     prev_index   = rel_times//tick
     prev_weight  = ((prev_index+1)*tick - rel_times)/tick
 
-    poses = (rover_pos(prev_index) * prev_weight + rover_pos(prev_index+1) * (1 - prev_weight))
+    poses = (rover_pos(prev_index) * prev_weight + rover_pos(prev_index+1) * (1 - prev_weight)) + pos_bias
     #dires = (rover_dir(prev_index) * prev_weight + rover_dir(prev_index+1) * (1 - prev_weight))
     track_model = tf.keras.Model(model_input, poses)
 
     #model to get all position (for training speed/acs etc)
     dummy_input = tf.keras.layers.Input((1), dtype=tf.int64)
-    poses = rover_pos(dummy_input)
+    poses = rover_pos(dummy_input) + pos_bias
     #dires = rover_dir(dummy_input)
     track_model_error = tf.keras.Model(dummy_input, poses)
 

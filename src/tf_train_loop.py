@@ -128,13 +128,13 @@ def get_track_path(folder, track):
             max_time = times[-1]
 
     baseline_ecef_coords  = scipy.signal.medfilt(baseline_ecef_coords, [7,1])
-    baseline_ecef_coords += np.random.normal(0.,2.,baseline_ecef_coords.shape)
+    baseline_ecef_coords += np.random.normal(0.,20.,baseline_ecef_coords.shape)
     model_track, track_model_error, num_measures, start_nanos, time_tick = tf_phone_model.createTrackModel(min_time,max_time, { 'times':baseline_times, 'values':baseline_ecef_coords}, mat_local)
 
     track_input = np.arange(num_measures)
     track_input = np.reshape(track_input,(-1,1))
     @tf.function
-    def train_step(optimizer):
+    def train_step_gnss(optimizer):
         for _ in range(16):
             with tf.GradientTape(persistent=True) as tape:
                 total_loss_psevdo = 0
@@ -143,47 +143,53 @@ def get_track_path(folder, track):
                     poses = model_track(phone_times[i], training=True)
                     poses = tf.reshape(poses,(1,-1,3))
                     psevdo_loss,delta_loss,delta_dif, psev_error = phone_models[i](poses, training=True)
-                    total_loss_psevdo += psevdo_loss/10
-                    total_loss_delta += delta_loss*2
+                    total_loss_psevdo += psevdo_loss/100
+                    total_loss_delta += delta_loss/10
+                total_loss = total_loss_delta +total_loss_psevdo
+
                 poses = track_model_error(track_input, training=True)
                 speed = poses[1:] - poses[:-1]
                 accs = speed[1:] - speed[:-1]
-                speed_loss_small = tf.reduce_mean(tf.abs(speed)) * 0.00001 + tf.reduce_mean(tf.abs(speed[:,2]))/100
-                accs_loss_small = tf.reduce_mean(tf.abs(accs)) /10
-                accs_loss_large = tf.reduce_mean(tf.nn.relu(tf.abs(accs) - 1)) *10
-                #total_loss = accs_loss_small + accs_loss_large + total_loss_psevdo/10 #+ total_loss_delta
-                #total_loss = total_loss_psevdo/10 #+ total_loss_delta
-                total_loss = ((accs_loss_small + accs_loss_large + speed_loss_small) + total_loss_psevdo) + total_loss_delta
+                speed_loss_small = tf.reduce_mean(tf.abs(speed)) * 0.00001 + tf.reduce_mean(tf.abs(speed[:,2]))/10
+                accs_loss_small = tf.reduce_mean(tf.abs(accs)) 
+                accs_loss_large = tf.reduce_mean(tf.nn.relu(tf.abs(accs) - 1)) 
+                total_loss += (accs_loss_small + accs_loss_large + speed_loss_small)
 
+            for i in range(len(phone_models)):
+                grads = tape.gradient(total_loss, phone_models[i].trainable_weights)
+                optimizer.apply_gradients(zip(grads, phone_models[i].trainable_weights))        
 
             grads = tape.gradient(total_loss, model_track.trainable_weights)
             optimizer.apply_gradients(zip(grads, model_track.trainable_weights))        
             grads = tape.gradient(total_loss, track_model_error.trainable_weights)
             optimizer.apply_gradients(zip(grads, track_model_error.trainable_weights))        
-            for i in range(len(phone_models)):
-                grads = tape.gradient(total_loss, phone_models[i].trainable_weights)
-                optimizer.apply_gradients(zip(grads, phone_models[i].trainable_weights))        
 
             del tape
-        return accs_loss_small, accs_loss_large, speed_loss_small, total_loss_psevdo, total_loss_delta, delta_dif, poses
+
+
+        return  total_loss, accs_loss_small, accs_loss_large, speed_loss_small, total_loss_psevdo, total_loss_delta, delta_dif, poses, psev_error
     
-    lr = 2.
+    lr = 2.0
     #optimizer = keras.optimizers.SGD(learning_rate=100., nesterov=True, momentum=0.5)
     #optimizer = keras.optimizers.Adam(learning_rate=0.5)
-    optimizer = keras.optimizers.Adam(learning_rate=1)
+    optimizer = keras.optimizers.Adam(learning_rate=0.001)
 
-    for step in range(32*40):
+    for step in range(32*60):
 
-        
-        for _ in range(16*2):
-            accs_loss_small, accs_loss_large, speed_loss_small, total_loss_psevdo, total_loss_delta, delta_dif, poses = train_step(optimizer)
+        total_loss, accs_loss_small, accs_loss_large, speed_loss_small = 0,0,0,0
+        for _ in range(16):
+            total_loss, accs_loss_small, accs_loss_large, speed_loss_small, total_loss_psevdo, total_loss_delta, delta_dif, poses, psev_error = train_step_gnss(optimizer)
 
         pred_pos = model_track(baseline_times*1000000).numpy()
         poses = poses.numpy()
+        psev_error = psev_error.numpy()
+        psev_error = psev_error[np.abs(psev_error) > 0]
+        percents_good_psev = np.sum(np.abs(psev_error) < 1)*100/len(psev_error)
         
 
         shift = pred_pos - gt_ecef_coords
-        shift = shift - np.mean(shift,axis=0,keepdims=True)
+        meanshift = np.mean(shift,axis=0,keepdims=True)
+        shift = shift - meanshift
         err3d = np.mean(np.linalg.norm(shift,axis = -1))
         dist_2d = np.linalg.norm(shift[:,:2],axis = -1)
         err2d = np.mean(dist_2d)
@@ -196,9 +202,9 @@ def get_track_path(folder, track):
         percents_good = np.sum(np.abs(delta_dif) < 0.1)*100/len(delta_dif)
 
 
-        print( "Training loss at step %d (%.2f,%.2f,%.2f,%.2f,%.4f): %.4f,%.4f (%.2f),%.4f,%.4f,%.4f  lr %.4f" % (step, err3d, err2d, err50, err95, (err50+err95)/2, float(total_loss_psevdo), float(total_loss_delta),percents_good,float(accs_loss_large),float(accs_loss_small), float(speed_loss_small), float(lr)), end='\r')
+        print( "Training loss at step %d (%.2f (%.2f),%.2f,%.2f,%.2f,%.4f): %.4f (%.2f),%.4f (%.2f),%.4f,%.4f,%.4f  lr %.4f" % (step, err3d, np.linalg.norm(meanshift), err2d, err50, err95, (err50+err95)/2, float(total_loss_psevdo), percents_good_psev, float(total_loss_delta),percents_good,float(accs_loss_large),float(accs_loss_small), float(speed_loss_small), float(lr)), end='\r')
         if(step % 32 == 0):
-            lr *= 0.9
+            lr *= 0.90
             optimizer.learning_rate = lr
             print()
         

@@ -4,6 +4,7 @@ from tensorflow.keras import layers
 from tensorflow.python.keras import regularizers
 from tensorflow.python.ops.array_ops import zeros
 from tensorflow.python.training.tracking import base
+from coords_tools import *
 
 autotune = tf.data.experimental.AUTOTUNE
 tf.keras.backend.set_floatx('float64')
@@ -57,6 +58,7 @@ def print_gt_score():
     folders = next(os.walk(folder[:-1]))[1]
     
     socores = []
+    base_wgs = np.array([37.416517, -122.204262, 63.6962])
     
     
     wgs_true = []
@@ -68,19 +70,30 @@ def print_gt_score():
         with open('values_y.pkl', 'rb') as f:
             difwgs = pickle.load(f)
     else:
-        model = tf.keras.models.load_model('mymodel.hdf5')
+        def my_loss(t,p):
+            return tf.reduce_mean(tf.nn.relu(tf.linalg.norm(t-p, axis = -1) - 1))
+        model = tf.keras.models.load_model('mymodel.hdf5',custom_objects={'my_loss':my_loss})
         for f in folders:
 
             #if 'SJC' not in f:
             #    continue
-
             try:
-                submission      = pd.read_csv(folder+f + "/submission.csv")
-                submission.set_index('millisSinceGpsEpoch', inplace = True)
-                submission.sort_index(inplace=True)
-                submission = submission[~submission.index.duplicated(keep='first')]
+                    submission      = pd.read_csv(folder+f + "/track.csv")
+                    times = submission['nanos'].to_numpy()*1e-6
+                    values = submission[['X','Y','Z']].to_numpy()
+                    values = pm.ecef2geodetic(values[:,0], values[:,1], values[:,2])
+                    values = values[:2]
+                    values = np.transpose(values)
             except:
-                break
+                try:
+                    submission      = pd.read_csv(folder+f + "/submission.csv")
+                    submission.set_index('millisSinceGpsEpoch', inplace = True)
+                    submission.sort_index(inplace=True)
+                    submission = submission[~submission.index.duplicated(keep='first')]
+                    times = submission.index.to_numpy()
+                    values = submission[['latDeg','lonDeg']].to_numpy()
+                except:
+                    break
 
             tracks = next(os.walk(folder+f))[1]
             curtrack = f[-5:-2]
@@ -98,30 +111,9 @@ def print_gt_score():
                 
                 count = 0
                 for _, row in truepos.iterrows():
-                    lat, lon, alt = row['latDeg'],row['lngDeg'],row['heightAboveWgs84EllipsoidM']
+                    lat, lon = row['latDeg'],row['lngDeg']
                     time = int(row['millisSinceGpsEpoch'])
-                    idx = submission.index.searchsorted(time)
-                    if idx >= len(submission.index):
-                        idx = len(submission.index) - 1
-
-                    if idx > 0 and time - submission.index[idx-1] < submission.index[idx] - time and time - submission.index[idx-1] < 10:
-                        idx -= 1
-                    if idx == 0:
-                        idx = 1
-
-                    timegt = submission.index[idx]
-                    r1 = submission.loc[timegt]
-                    timegt2 = submission.index[idx-1]
-                    r2 = submission.loc[timegt2]
-
-                    if abs(timegt - timegt2) < 10000:
-                        #print('Aproximating', time, row['phone'])
-                        k1 = (time - timegt2)/(timegt - timegt2)
-                        latr = r1['latDeg']*k1 + r2['latDeg']*(1-k1)
-                        lonr = r1['lonDeg']*k1 + r2['lonDeg']*(1-k1)
-                    else:
-                        print('No values for', time, row['phone'])
-                        continue
+                    latr,lonr = getValuesAtTimeLiniar(times,values,time)
 
                     count += 1
                     wgs_pred.append(np.array([latr,lonr]))
@@ -141,9 +133,10 @@ def print_gt_score():
                     dt.extend(tf.keras.utils.to_categorical(curphone,7))
                     dt.extend(tf.keras.utils.to_categorical(curtrack,5))
                     dt.extend((wgs_pred[-1] - np.array([37.41661260440319,-122.08173723432392]))*100)
+                    dt.append(calc_haversine(latr, lonr, base_wgs[0], base_wgs[1]))
                     data.append(dt)
                     lastpos = wgs_pred[-1]
-
+                
                 d =np.array(data[-count:])
                 sh = model(d).numpy()*1e-6
                 wgs_pred2 = np.array(wgs_pred[-count:]) + sh
@@ -184,23 +177,24 @@ def print_gt_score():
         with open('values_y.pkl', 'wb') as f:
             pickle.dump(difwgs, f, pickle.HIGHEST_PROTOCOL)
 
-    inp = tf.keras.layers.Input((16))
+    inp = tf.keras.layers.Input((17))
     x = inp
-    #x = tf.keras.layers.BatchNormalization()(x)
-    x = tf.keras.layers.Dense(8, activation='relu')(x)
-    x = tf.keras.layers.Dense(8, activation='relu')(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.Dense(16, activation='relu')(x)
+    #x = tf.keras.layers.Dense(16, activation='relu')(x)
+    #x = tf.keras.layers.Dense(16, activation='relu')(x)
     #x = tf.keras.layers.Dense(8, activation='relu')(x)
     #x = tf.keras.layers.BatchNormalization()(inp)
     #x = tf.keras.layers.Dense(8, activation='relu')(x)
     #x = tf.keras.layers.Dense(8, activation='relu')(x)
     x = tf.keras.layers.Dense(2, kernel_regularizer=tf.keras.regularizers.l1_l2(l1=1e-4, l2=1e-8))(x)
     model = tf.keras.Model(inp,x)
-    model.compile(optimizer=tf.keras.optimizers.Adam(lr=0.1), loss = 'mae')
-    model.fit(data,difwgs, shuffle=True, batch_size = 4096, epochs = 256, callbacks = [tf.keras.callbacks.ReduceLROnPlateau(monitor='loss', verbose=1,  patience=25)] )
+    model.compile(optimizer=tf.keras.optimizers.Adam(lr=0.1), loss = my_loss)
+    model.fit(data,difwgs, shuffle=True, batch_size = 4096, epochs = 512, callbacks = [tf.keras.callbacks.ReduceLROnPlateau(monitor='loss', verbose=1,  patience=25)] )
     model.save('mymodel.hdf5')
 
 
-    ind = np.linalg.norm(difwgs, axis = -1) < 20
+    ind = np.linalg.norm(difwgs-np.array([[5,-15]]), axis = -1) < 20
     heatmap, xedges, yedges = np.histogram2d(difwgs[ind,1], difwgs[ind,0], bins=100)
     extent = [xedges[0], xedges[-1], yedges[0], yedges[-1]]
 

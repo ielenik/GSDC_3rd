@@ -65,9 +65,9 @@ class WeightsData(tf.keras.layers.Layer):
         })
         return config
 
-class PsevdoDistancesLayer(tf.keras.layers.Layer):
+class PsevdoDistancesLayer2(tf.keras.layers.Layer):
     def __init__(self, num_sats, num_epochs, sat_types, sat_poses, psevdo_dist, psevdoweights, **kwargs):
-        super(PsevdoDistancesLayer, self).__init__(**kwargs)
+        super(PsevdoDistancesLayer2, self).__init__(**kwargs)
         self.num_sats = num_sats
         self.num_epochs = num_epochs
         self.sat_poses = tf.Variable(sat_poses, trainable=False)
@@ -76,7 +76,7 @@ class PsevdoDistancesLayer(tf.keras.layers.Layer):
         self.sat_types = tf.Variable(sat_types, trainable=False)
 
     def build(self, input_shape):
-        super(PsevdoDistancesLayer, self).build(input_shape)
+        super(PsevdoDistancesLayer2, self).build(input_shape)
         self.isrbm_bias = self.add_weight(name='psevdo_isrbm_bias', shape=(8, self.num_epochs), 
                                 dtype = tf.float64,
                                 initializer=tf.keras.initializers.Constant(np.zeros((8, self.num_epochs))),
@@ -87,6 +87,37 @@ class PsevdoDistancesLayer(tf.keras.layers.Layer):
         isrbm = tf.gather(self.isrbm_bias, self.sat_types)
         isrbm = tf.transpose(isrbm)
         errors = tf.abs(self.psevdoweights*(distance -  self.psevdo_dist - isrbm))
+        errors = errors - tf.nn.relu(errors - 1)*0.7
+
+        #return tf.reduce_mean((self.psevdoweights*tf.nn.softsign(tf.abs(errors)/5))), errors
+        return tf.reduce_mean(errors), errors
+
+    def compute_output_shape(self, _):
+        return (1)
+
+class PsevdoDistancesLayer(tf.keras.layers.Layer):
+    def __init__(self, num_sats, num_epochs, base_poses, sat_types, sat_dirs, psevdo_shift, psevdoweights, **kwargs):
+        super(PsevdoDistancesLayer, self).__init__(**kwargs)
+        self.num_sats = num_sats
+        self.num_epochs = num_epochs
+        self.base_poses = tf.Variable(base_poses, trainable=False)
+        self.sat_types = tf.Variable(sat_types, trainable=False)
+        self.sat_dirs = tf.Variable(sat_dirs, trainable=False)
+        self.psevdo_shift = tf.Variable(psevdo_shift, trainable=False)
+        self.psevdoweights = tf.Variable(psevdoweights, trainable=False)
+
+    def build(self, input_shape):
+        super(PsevdoDistancesLayer, self).build(input_shape)
+        self.isrbm_bias = self.add_weight(name='psevdo_isrbm_bias', shape=(8, self.num_epochs), 
+                                dtype = tf.float64,
+                                initializer=tf.keras.initializers.Constant(np.zeros((8, self.num_epochs))),
+                                trainable=True)
+
+    def call(self, inputs):
+        shiftsnow = tf.reduce_sum( (inputs - self.base_poses)*self.sat_dirs, axis = -1)
+        isrbm = tf.gather(self.isrbm_bias, self.sat_types)
+        isrbm = tf.transpose(isrbm)
+        errors = tf.abs(self.psevdoweights*(shiftsnow -  self.psevdo_shift - isrbm))
         errors = errors - tf.nn.relu(errors - 3)*0.7
 
         #return tf.reduce_mean((self.psevdoweights*tf.nn.softsign(tf.abs(errors)/5))), errors
@@ -122,10 +153,7 @@ class DeltaRangeLayer(tf.keras.layers.Layer):
     def compute_output_shape(self, _):
         return (1)
 
-def check_deltas_valid(sat_dir_in, lens_in):
-    index = ~np.isnan(lens_in)
-    sat_dir = sat_dir_in[index]
-    lens = lens_in[index]
+def check_deltas_valid(sat_dir, lens):
 
     n = len(lens)
     if n < 6:
@@ -136,6 +164,7 @@ def check_deltas_valid(sat_dir_in, lens_in):
     if num > 8:
         num = 8
 
+    sat_dir = sat_dir.copy()
     sat_dir[:,2] = 1
     for _ in range(250):
         indexes = np.random.choice(n, 3, replace=False)
@@ -147,13 +176,114 @@ def check_deltas_valid(sat_dir_in, lens_in):
             continue
 
         x_hat = np.dot(mat, vec)
-        x_hat = np.reshape(x_hat,(1,4))
+        x_hat = np.reshape(x_hat,(1,3))
         cur_shifts = np.sum(sat_dir*x_hat, axis=1)
         rows = np.abs(cur_shifts - lens)
         if np.sum(rows < 0.1) > num:
             return True
             
     return False
+def createGpsPhoneModelFromDataFile(export_data, phone, df_baseline, mat_local):
+
+    times = np.array(export_data[phone]['times'])
+    sat_psevdodist      = np.array(export_data[phone]['psevdo'])
+    sat_psevdoweights   = np.array(export_data[phone]['psevdo_weight'])
+    sat_deltarange = np.array(export_data[phone]['range'])
+    sat_deltavalid = np.array(export_data[phone]['range_valid'])
+    sat_positions = np.array(export_data[phone]['sats'])
+    sat_types_in = np.array(export_data['sat_types'])
+    #sat_types_in = sat_types_in[::2].astype(np.int32)
+    sat_types = np.zeros((64)).astype(np.int32)
+    sat_types[:len(sat_types_in)] = sat_types_in
+
+    num_epochs = len(times)
+    baselines = np.zeros((num_epochs, 3))
+    num_used_satelites = 64
+
+    for i in range(num_epochs):
+        baselines[i] = getValuesAtTimeLiniar(df_baseline['times'], df_baseline['values'], times[i]*1e-6)
+        baselines[i] = np.matmul(baselines[i], mat_local)
+        for j in range(64):
+            sat_positions[i,j] = np.matmul(sat_positions[i,j], mat_local)
+
+    sat_psevdoweights[np.isnan(sat_psevdodist)] = 0
+    sat_psevdodist[sat_psevdoweights == 0] = 0
+
+    baselines = np.reshape(baselines,(-1,1,3))
+    sat_realdist = np.linalg.norm(sat_positions-baselines, axis = -1)
+    sat_realdist[sat_psevdoweights == 0] = 0
+    dists = (sat_psevdodist - sat_realdist)
+    dists_corr = dists.copy()
+    dists_corr[sat_psevdoweights == 0] = 0
+    for i in range(num_epochs):
+        isbrms = [[],[],[],[],[],[],[],[]]
+        for j in range(num_used_satelites):
+            if sat_psevdoweights[i,j] == 0:
+                continue
+            isbrms[sat_types[j]].append(dists_corr[i,j])
+        for j in range(8):
+            if len(isbrms[j]) == 0:
+                isbrms[j] = 0
+            else:
+                isbrms[j] = np.median(isbrms[j])
+        for j in range(num_used_satelites):
+            if sat_psevdoweights[i,j] == 0:
+                continue
+            dists_corr[i,j] -= isbrms[sat_types[j]]
+            sat_psevdodist[i,j] -= isbrms[sat_types[j]]
+
+    dists_corr[sat_psevdoweights == 0] = 0
+    print(np.sum(abs(dists_corr) > 1000))
+    dists_corr = dists_corr*sat_psevdoweights
+    loss = np.mean(np.abs(dists_corr[sat_psevdoweights > 0]))
+    print("Initial psevdo range loss ", loss)
+
+    sat_directions = sat_positions - baselines
+    sat_directions = sat_directions/np.linalg.norm(sat_directions,axis=-1,keepdims=True)
+
+    if False:
+        psevdo_layer = PsevdoDistancesLayer2(num_used_satelites,num_epochs,sat_types,sat_positions,sat_psevdodist,sat_psevdoweights)
+    else:
+        sat_psevdoshift = sat_psevdodist - sat_realdist
+        sat_directions[np.isnan(sat_directions)] = 0
+        sat_psevdoshift[np.isnan(sat_psevdoshift)] = 0
+        sat_psevdoweights[np.isnan(sat_psevdoweights)] = 0
+        psevdo_layer = PsevdoDistancesLayer(num_used_satelites,num_epochs,baselines,sat_types,sat_directions,-sat_psevdoshift,sat_psevdoweights)
+
+    sat_directions = sat_directions[1:]
+    sat_deltarange = sat_deltarange[1:]
+    sat_deltavalid = np.array(sat_deltavalid[1:]).astype(np.float64)
+
+    baselines = baselines[:-1]
+    for i in range(num_epochs-1):
+        ind = (sat_deltavalid[i]>0)
+
+        '''
+        if check_deltas_valid(sat_directions[i,ind],sat_deltarange[i,ind]) == False:
+            sat_deltavalid[i] = 0
+            sat_deltarange[i] = 0
+            continue
+        '''
+        median_delta = np.median(sat_deltarange[i,ind])
+        sat_deltarange[i,ind] -= median_delta
+
+    sat_deltavalid[np.abs(sat_deltarange) > 30] = 0 #
+    sat_deltarange[np.abs(sat_deltarange) > 30] = 0 #
+    print(np.sum(sat_deltavalid    > 0))
+    print(np.sum(sat_psevdoweights > 0))
+
+    sat_deltarange[np.isnan(sat_deltarange)] = 0
+    sat_directions[np.isnan(sat_directions)] = 0
+    sat_deltavalid[np.isnan(sat_deltavalid)] = 0
+    delta_layer = DeltaRangeLayer(num_used_satelites,num_epochs,sat_directions, sat_deltarange, sat_deltavalid)
+
+    model_input = tf.keras.layers.Input((num_epochs,3), dtype=tf.float64)
+    positions = tf.reshape(model_input,(num_epochs,1,3))
+    psevdo_loss, psevdo_errors = psevdo_layer(positions)
+    delta_loss, delta_errors = delta_layer(positions)
+    
+    gps_phone_model = tf.keras.Model(model_input, [psevdo_loss, delta_loss, delta_errors, psevdo_errors])
+    return gps_phone_model, times
 
 def createGpsPhoneModel(df_raw, df_baseline, mat_local, dog, slac):
     LIGHTSPEED = 2.99792458e8
@@ -186,6 +316,9 @@ def createGpsPhoneModel(df_raw, df_baseline, mat_local, dog, slac):
     df_raw['Epoch'] = 0
     df_raw.loc[df_raw['NanosSinceGpsEpoch'] - df_raw['NanosSinceGpsEpoch'].shift() > 10*1e6, 'Epoch'] = 1
     df_raw['Epoch'] = df_raw['Epoch'].cumsum()
+    #num_epochs         = df_raw['Epoch'].max() + 1
+    #df_raw= df_raw[df_raw['Epoch'] >= num_epochs - 500].copy()
+    #df_raw['Epoch'] -= num_epochs - 500
 
     delta_millis = df_raw['PrNanos'] / 1e6
     where_good_signals = (delta_millis > -20) & (delta_millis < 300)
@@ -206,7 +339,7 @@ def createGpsPhoneModel(df_raw, df_baseline, mat_local, dog, slac):
     for _, df in sat_uniq.iterrows():
         sat_num = df['SAT_FULL_INDEX']
         sat_name = df['SvNameType']
-        while sat_num < len(sat_names) - 1:
+        while sat_num > len(sat_names):
             sat_names.append('dummy')
             sat_types.append(7)
 
@@ -245,8 +378,8 @@ def createGpsPhoneModel(df_raw, df_baseline, mat_local, dog, slac):
         baselines[epoch_number] = getValuesAtTimeLiniar(df_baseline['times'], df_baseline['values'], time_nanos*1e-6)
         baselines[epoch_number] = np.matmul(baselines[epoch_number], mat_local)
 
-        if epoch_number == 800:
-            deltarange      = 123
+        #if epoch_number == 800:
+        #    deltarange      = 123
         #if epoch_number == 66:
         #    break
 
@@ -315,10 +448,15 @@ def createGpsPhoneModel(df_raw, df_baseline, mat_local, dog, slac):
     loss = np.mean(np.abs(dists_corr[sat_psevdovalid > 0]))
     print("Initial psevdo range loss ", loss)
 
-    psevdo_layer = PsevdoDistancesLayer(num_used_satelites,num_epochs,sat_types,sat_positions,sat_psevdodist,sat_psevdoweights)
-
     sat_directions = sat_positions - baselines
     sat_directions = sat_directions/np.linalg.norm(sat_directions,axis=-1,keepdims=True)
+
+    if False:
+        psevdo_layer = PsevdoDistancesLayer2(num_used_satelites,num_epochs,sat_types,sat_positions,sat_psevdodist,sat_psevdoweights)
+    else:
+        sat_psevdoshift = sat_psevdodist - sat_realdist
+        psevdo_layer = PsevdoDistancesLayer(num_used_satelites,num_epochs,baselines,sat_types,sat_directions,-sat_psevdoshift,sat_psevdoweights)
+
     sat_directions = sat_directions[1:]
     sat_deltarange = sat_deltarange[1:] - sat_deltarange[:-1]
     sat_deltavalid = sat_deltavalid[1:]*sat_deltavalid[:-1]
@@ -333,6 +471,12 @@ def createGpsPhoneModel(df_raw, df_baseline, mat_local, dog, slac):
 
     for i in range(num_epochs-1):
         ind = (sat_deltavalid[i]>0)
+
+        if check_deltas_valid(sat_directions[i,ind],sat_deltarange[i,ind]) == False:
+            sat_deltavalid[i] = 0
+            sat_deltarange[i] = 0
+            continue
+
         median_delta = np.median(sat_deltarange[i,ind])
         sat_deltarange[i,ind] -= median_delta
 
@@ -356,9 +500,9 @@ def createTrackModel(start_nanos, end_nanos, df_baseline, mat_local):
 
 
     #initialize positions at 10hz from baseline
-    tick = 20000000
-    start_nanos = start_nanos - 10*tick
-    end_nanos = end_nanos + 10*tick
+    tick = 500000000
+    start_nanos = start_nanos - 10000000000
+    end_nanos = end_nanos + 10000000000
     num_measures = (end_nanos - start_nanos)//tick # ten times a second
     positions = np.zeros((num_measures,3))
     for i in range(num_measures):

@@ -362,10 +362,11 @@ def get_track_path(folder, track):
         baseline_times.append(timenano)
         baseline_ecef_coords.append(np.array(pm.geodetic2ecef(latbl,lonbl,altbl, deg = True)))
 
-
+    sat_types = []
     for i in range(64):
         try:
             reg = dfs[dfs.sfid == i].iloc[0]
+            sat_types.append(reg['stid'])
             num = str(int(reg['svid']))
             if len(num) == 1:
                 num = "0"+num
@@ -389,7 +390,6 @@ def get_track_path(folder, track):
             else:
                 tpd += "_1"
             
-            sat_types.append(tpd)
             if tpd in sat_registry:
                 ind = sat_registry[tpd]
                 slac[:,i] = slac_old[:,ind]
@@ -441,6 +441,17 @@ def get_track_path(folder, track):
     time_bias_delta = [[],[],[],[],[]]
     track_speeds = [[],[],[],[],[]]
 
+    export_data = {}
+    for phone in phones:
+        export_data[phone] = {}
+        export_data[phone]['times'] = []
+        export_data[phone]['psevdo'] = []
+        export_data[phone]['psevdo_weight'] = []
+        export_data[phone]['range'] = []
+        export_data[phone]['range_valid'] = []
+        export_data[phone]['sats'] = []
+    export_data['sat_names'] = sat_names
+    export_data['sat_types'] = sat_types
 
     for (time_nanos, phone), epoch in tqdm(dfs.groupby(['nanosSinceGpsEpoch', 'phoneName'])):
         phoneind = phones[phone]
@@ -526,7 +537,7 @@ def get_track_path(folder, track):
             
         sats2 -= sats
         rsat = rotate_sat(sats, timesinm) 
-        
+       
         corr = getCorrections(time_nanos,rsat)
         index_corr  = ~np.isnan(corr)
         psevdorover2 = psevdorover.copy()
@@ -571,7 +582,8 @@ def get_track_path(folder, track):
             sat_psevdo_type2.extend(signaltype[index_psev, 1])
 
         real_shift = roverpos-rover_last[phoneind]
-        dist_changes = np.sum(sat_vect*np.reshape(real_shift,(1,3)), axis = -1)
+        dist_changes = np.sum(sat_vect*np.reshape(real_shift,(1,3)), axis = -1) 
+        dist_changes += deltarange
         dist_changes = np.reshape(dist_changes,(-1))
         dist_changes = dist_changes[~np.isnan(dist_changes)]
         dist_changes = np.sort(dist_changes)
@@ -594,20 +606,34 @@ def get_track_path(folder, track):
             index_delta_last = index_delta
             err[~index_delta] = 1000
             index_delta = np.abs(err) < 0.1
-            if len(deltarange[index_delta]) >= 6: #(len(deltarange[index_delta]) >= 8 or len(deltarange[index_delta_last])*3//4 <= len(deltarange[index_delta])):
-                sat_range_vects.extend(sat_vect[index_delta_last])
-                sat_range_change.extend(deltarange[index_delta_last])
-                sat_range_epoch.extend([epoch_num]*len(deltarange[index_delta_last])) 
-                sat_range_prev_epoch.extend([prev_epoch_num]*len(deltarange[index_delta_last])) 
-                sat_range_phone.extend([phoneind]*len(deltarange[index_delta_last])) 
+            if (len(deltarange[index_delta]) >= 8):# or len(deltarange[index_delta_last]) <= len(deltarange[index_delta])):
+                sat_range_vects.extend(sat_vect[index_delta])
+                sat_range_change.extend(deltarange[index_delta])
+                sat_range_epoch.extend([epoch_num]*len(deltarange[index_delta])) 
+                sat_range_prev_epoch.extend([prev_epoch_num]*len(deltarange[index_delta])) 
+                sat_range_phone.extend([phoneind]*len(deltarange[index_delta])) 
             else:
                 _, err = calc_shift_fromsat2d(sat_vect, deltarange)
+
+        psevdorover[~index_psev] = 0
+        uncert[~index_psev] = 0
+        deltarange[~index_delta] = 0
+
+        export_data[phone]['times'].append(time_nanos)
+        export_data[phone]['psevdo'].append(psevdorover)
+        export_data[phone]['psevdo_weight'].append(uncert)
+        export_data[phone]['range'].append(deltarange)
+        export_data[phone]['range_valid'].append(index_delta)
+        export_data[phone]['sats'].append(rsat)
 
         prev_sat[phoneind] = rsat
         bias_last[phoneind] = bias
         rover_last[phoneind] = roverpos
         epoch_num += 1
 
+    with open(folder + "/" + track + "/export.dat", 'wb') as f:
+        pickle.dump(export_data, f, pickle.HIGHEST_PROTOCOL)
+        
     max_bias_len = 0
     for i in range(num_phones):
         #time_bias_range[i].append(0)
@@ -625,6 +651,7 @@ def get_track_path(folder, track):
         time_bias_range[i] -= med
 
     epoch_arrange = np.arange(max_bias_len)
+    '''
     lbl = []
     for i in range(num_phones):
         lbl.append(phone_names[i] + " GT bias")
@@ -642,7 +669,7 @@ def get_track_path(folder, track):
         pyplot.plot(epoch_arrange, pl + i*10)
     pyplot.legend(lbl)
     pyplot.show()        
-
+    '''
 
 
 
@@ -759,6 +786,7 @@ def get_track_path(folder, track):
                 pos_for_range1 = base_model([sat_range_epoch_tn,sat_dummyid_tn, sat_dummyid2_tn, sat_range_phone_tn], training=True)
                 pos_for_range2 = base_model([sat_range_epoch_m1_tn,sat_dummyid_tn, sat_dummyid2_tn, sat_range_phone_tn], training=True)
                 shifts = tf.reduce_sum((pos_for_range1[0] - pos_for_range2[0]) * sat_range_vects_tn, axis = -1)  + sat_range_change_tn - tf.squeeze(pos_for_range1[1]-pos_for_range2[1]) - tf.squeeze(pos_for_range1[3])
+                #loss_range = tf.abs(shifts) - 0.7*tf.nn.relu(tf.abs(shifts)-0.3) 
                 loss_range = tf.nn.softsign(tf.abs(shifts))
                 #loss_range = tf.abs(shifts)
                 #print(shifts)
@@ -793,7 +821,7 @@ def get_track_path(folder, track):
 
                 loss_der =  loss_der1+loss_der2+shift_loss
 
-                total_loss = loss_psevdo*1e-1 #+ loss_range/2 + loss_der * 5 
+                total_loss = loss_psevdo*1e-1 + loss_range/2 + loss_der * 5 
 
             grads = tape.gradient(total_loss, base_model.trainable_weights)
             optimizer.apply_gradients(zip(grads, base_model.trainable_weights))        
@@ -837,6 +865,13 @@ def get_track_path(folder, track):
             optimizer.learning_rate = lr
             print()
 
+            if True:
+                plt.clf()
+                plt.scatter(pos_3d_pred[:,1], pos_3d_pred[:,0], s=0.2)
+                plt.scatter(pos_3d_true[:,1], pos_3d_true[:,0], s=0.2)
+                #fig1.canvas.start_event_loop(sys.float_info.min) #workaround for Exception in Tkinter callback
+                plt.savefig("fig/ol"+str(step+10000)+".png", dpi = 1000)
+                plt.close()
             if False:
                 accel = accel.numpy()
                 speed = speed.numpy()

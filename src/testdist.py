@@ -27,15 +27,20 @@ import tf_train_loop
 
 
 def main():
-    tf_train_loop.get_track_path('data/train','2021-04-22-US-SJC-1')
+    #gt_total_score.print_gt_score()
+    #return
+    #tf_gps_model.get_track_path('data/train','2021-04-22-US-SJC-1')
+    #tf_train_loop.get_track_path('data/train','2021-04-22-US-SJC-1')
 
-    subset = 'train'
+    subset = 'test'
     tests = next(os.walk('data/'+subset))[1]
     for g in tests:
+        if os.path.exists('data/'+subset+'/'+g+'/track.csv'):
+            continue
+        print(g)
         tf_train_loop.get_track_path('data/'+subset,g)
 
 
-    #gt_total_score.print_gt_score()
     #return 
     #tf_gps_model.get_track_path('data/train','2020-07-17-US-MTV-2')
     #tf_train_loop.get_track_path('data/train','2020-07-17-US-MTV-2')
